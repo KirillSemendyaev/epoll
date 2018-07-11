@@ -7,9 +7,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <poll.h>
+#include <sys/epoll.h>
 
-#define CL_NUM 2
+#define PR_NUM 2
 
 int main(int argc, char **argv)
 {
@@ -18,19 +18,15 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
-	struct pollfd clients[CL_NUM];
+	int prsocks[PR_NUM], con_fd, ret, on = 1, epoll_fd = epoll_create(PR_NUM);
+	int exitFlag = 1;
 
-	int con_fd, ret;
 	size_t len;
 
 	char buf[16] = {0};
 	len = sizeof(buf);
-	clients[0].fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	clients[1].fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	clients[0].events = clients[1].events = POLLIN;
-	int on = 1;
-
-
+	prsocks[0] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	prsocks[1] = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	
 	struct sockaddr_in target, server;
 	socklen_t target_size = sizeof(target), server_size = sizeof(server);
@@ -38,66 +34,93 @@ int main(int argc, char **argv)
 	server.sin_family = AF_INET;
 	server.sin_port = htons(atoi(argv[2]));
 	server.sin_addr.s_addr = inet_addr(argv[1]);
-	for (int i = 0; i < CL_NUM; ++i) {
-		if (setsockopt(clients[i].fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+	for (int i = 0; i < PR_NUM; ++i) {
+		if (setsockopt(prsocks[i], SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
 			perror("setsockopt-reuseaddr");
 			return -4;
 		}
-		if (setsockopt(clients[i].fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
+		if (setsockopt(prsocks[i], SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
 			perror("setsockopt-reuseport");
 			return -4;
 		}
-		ret = bind(clients[i].fd, (struct sockaddr *) &server, server_size);
+		ret = bind(prsocks[i], (struct sockaddr *) &server, server_size);
 		if (ret == -1) {
 			perror("bind");
 			return -3;
 		}
 	}
 
-	listen(clients[1].fd, 20);
-	while (1)	{
-		for (int i = 0; i < CL_NUM; ++i)
-			clients[i].revents = 0;
+	struct epoll_event prevent, out_events[2];
+	prevent.events = EPOLLIN;
+	prevent.data.fd = prsocks[0];
+	ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, prsocks[0], &prevent);
+	if (ret < 0) {
+		perror("epoll_ctl");
+		return -6;
+	}
+	prevent.events = EPOLLIN | EPOLLET;
+	prevent.data.fd = prsocks[1];
+	ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, prsocks[1], &prevent);
+	if (ret < 0) {
+		perror("epoll_ctl");
+		return -6;
+	}
+
+
+	listen(prsocks[1], 20);
+	printf("ready\n");
+	do	{
 		memset(buf, 0, len);
 		memset(&target, 0, target_size);
-		poll(clients, CL_NUM, -1);
-		if (clients[0].revents & POLLIN) {
-			recvfrom(clients[0].fd, buf, len, 0, (struct sockaddr *) &target, &target_size);
-			printf("UDP Connection from %s:%d\n", inet_ntoa(target.sin_addr), ntohs(target.sin_port));
-			if (strcmp(buf, "Quit") != 0) {
-				strcpy(buf + 5, " world!");
-				sendto(clients[0].fd, buf, len, MSG_CONFIRM, (struct sockaddr *) &target, target_size);
-				printf("Replied\n");
-				continue;
-			} else {
-				strcpy(buf, "OK!");
-				sendto(clients[0].fd, buf, len, MSG_CONFIRM, (struct sockaddr *) &target, target_size);
-				printf("I QUIT\n");
-				break;
-			}
+		ret = epoll_wait(epoll_fd, out_events, 2, -1);
+		if (ret == -1) {
+			perror("epoll_wait");
+			return -34;
 		}
-		if (clients[1].revents & POLLIN) {
-			con_fd = accept(clients[1].fd, (struct sockaddr *) &target, &target_size);
-			recv(con_fd, buf, len, 0);
-			printf("TCP Connection from %s:%d\n", inet_ntoa(target.sin_addr), ntohs(target.sin_port));
-			if (strcmp(buf, "Quit") != 0) {
-				strcpy(buf + 5, " world!");
-				send(con_fd, buf, len, 0);
-				printf("Replied\n");
-				close(con_fd);
-			} else {
-				strcpy(buf, "OK!");
-				send(con_fd, buf, len, 0);
-				printf("I QUIT\n");
-				close(con_fd);
-				break;
+		printf("Got smth (ret = %d)\n", ret);
+		for (int i = 0; i < ret; ++i) {
+			if (out_events[i].data.fd == prsocks[0]) {
+				recvfrom(prsocks[0], buf, len, 0, (struct sockaddr *) &target, &target_size);
+				printf("UDP Connection from %s:%d\n", inet_ntoa(target.sin_addr), ntohs(target.sin_port));
+				if (strcmp(buf, "Quit") != 0) {
+					strcpy(buf + 5, " world!");
+					sendto(prsocks[0], buf, len, MSG_CONFIRM, (struct sockaddr *) &target, target_size);
+					printf("Replied\n");
+					continue;
+				} else {
+					strcpy(buf, "OK!");
+					sendto(prsocks[0], buf, len, MSG_CONFIRM, (struct sockaddr *) &target, target_size);
+					printf("I QUIT\n");
+					exitFlag = 0;
+				}
 			}
+
+			if (out_events[i].data.fd == prsocks[1]) {
+				con_fd = accept(prsocks[1], (struct sockaddr *) &target, &target_size);
+				recv(con_fd, buf, len, 0);
+				printf("TCP Connection from %s:%d\n", inet_ntoa(target.sin_addr), ntohs(target.sin_port));
+				if (strcmp(buf, "Quit") != 0) {
+					strcpy(buf + 5, " world!");
+					send(con_fd, buf, len, 0);
+					printf("Replied\n");
+					close(con_fd);
+				} else {
+					strcpy(buf, "OK!");
+					send(con_fd, buf, len, 0);
+					printf("I QUIT\n");
+					close(con_fd);
+					exitFlag = 0;
+				}
+			}
+
 		}
 
+	} while (exitFlag);
+	for (int i = 0; i < PR_NUM; ++i) {
+		close(prsocks[i]);
 	}
-	for (int i = 0; i < CL_NUM; ++i) {
-		close(clients[i].fd);
-	}
+
+	close(epoll_fd);
 
 	return 0;
 }
